@@ -1,7 +1,8 @@
 """Tests for the validator manifest store."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+from scoring_service.clients.rpc import RPCClient
 from scoring_service.services.manifest_store import (
     ManifestResolution,
     load_stored_manifests,
@@ -147,3 +148,44 @@ class TestUnreachableNode:
         assert resolution.from_rpc == []
         assert resolution.from_store == ["nHU_a"]
         assert resolution.missing == ["nHU_b"]
+
+
+def _rpc_answering(mock_client_cls, body):
+    """A real RPCClient whose node answers every call with ``body``."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = body
+    mock_http = MagicMock(post=MagicMock(return_value=mock_response))
+    mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_http)
+    mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+    return RPCClient(rpc_url="https://rpc.test.example.com")
+
+
+def _inserts(cursor):
+    return [
+        c
+        for c in cursor.execute.call_args_list
+        if c.args[0].lstrip().startswith("INSERT")
+    ]
+
+
+class TestNonObjectRpcBody:
+    @patch("scoring_service.clients.rpc.httpx.Client")
+    def test_resolve_falls_back_to_store_when_node_answers_a_list(self, mock_client_cls):
+        rpc = _rpc_answering(mock_client_cls, [])
+        conn, cursor = _conn(stored_rows=[("nHU_a", "manifest-a-stored")])
+
+        resolution = resolve_manifests(conn, rpc, ["nHU_a", "nHU_b"])
+
+        assert resolution.manifests == {"nHU_a": "manifest-a-stored"}
+        assert resolution.from_rpc == []
+        assert resolution.from_store == ["nHU_a"]
+        assert resolution.missing == ["nHU_b"]
+        assert not _inserts(cursor)
+
+    @patch("scoring_service.clients.rpc.httpx.Client")
+    def test_refresh_skips_lookups_when_node_answers_a_list(self, mock_client_cls):
+        rpc = _rpc_answering(mock_client_cls, [])
+        conn, cursor = _conn(stored_rows=[("nHU_a", "manifest-a-stored")])
+
+        assert refresh_manifest_store(conn, rpc, ["nHU_a", "nHU_b"]) == 0
+        assert not _inserts(cursor)

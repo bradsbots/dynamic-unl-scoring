@@ -37,7 +37,23 @@ class RPCClient:
                     )
                     response.raise_for_status()
                     data = response.json()
+                    # A body that is not a JSON object is a malformed answer,
+                    # not a transport failure: give up like an RPC error does.
+                    if not isinstance(data, dict):
+                        logger.error(
+                            "RPC %s returned a non-object body (%s)",
+                            method,
+                            type(data).__name__,
+                        )
+                        return None
                     result = data.get("result", {})
+                    if not isinstance(result, dict):
+                        logger.error(
+                            "RPC %s returned a non-object result (%s)",
+                            method,
+                            type(result).__name__,
+                        )
+                        return None
                     if result.get("error"):
                         logger.error(
                             "RPC %s error: %s — %s",
@@ -86,8 +102,15 @@ class RPCClient:
             return None
 
         manifest = result.get("manifest")
-        if not manifest:
+        if manifest is None:
             logger.warning("No manifest returned for %s", public_key)
+            return None
+        if not isinstance(manifest, str) or not manifest:
+            logger.error(
+                "RPC manifest for %s is not a non-empty string (%s)",
+                public_key,
+                type(manifest).__name__,
+            )
             return None
 
         return manifest

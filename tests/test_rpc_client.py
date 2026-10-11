@@ -26,6 +26,31 @@ MANIFEST_RESPONSE = {
     }
 }
 
+# JSON bodies a misbehaving node or proxy can return that are not the
+# {"result": {...}} object the client expects, with the type the log names.
+NON_OBJECT_BODIES = [
+    pytest.param(None, "non-object body (NoneType)", id="body-null"),
+    pytest.param([], "non-object body (list)", id="body-list"),
+    pytest.param("string", "non-object body (str)", id="body-string"),
+    pytest.param({"result": None}, "non-object result (NoneType)", id="result-null"),
+    pytest.param({"result": "busy"}, "non-object result (str)", id="result-string"),
+    pytest.param({"result": []}, "non-object result (list)", id="result-list"),
+]
+
+
+def _mock_post(mock_client_cls, body):
+    mock_response = MagicMock()
+    mock_response.json.return_value = body
+    mock_response.raise_for_status = MagicMock()
+    mock_http = MagicMock(post=MagicMock(return_value=mock_response))
+    mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_http)
+    mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+    return mock_http
+
+
+def _errors(caplog):
+    return [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+
 
 class TestInit:
     def test_raises_when_rpc_url_missing(self):
@@ -99,6 +124,52 @@ class TestFetchManifest:
         assert result == "JAAAAAJxIe23EdIq5b/pUIYmS3t0y/Irqy94rM01tnBCJNsXOax0CHMh"
         assert mock_sleep.called
 
+    @pytest.mark.parametrize("body, logged", NON_OBJECT_BODIES)
+    @patch("scoring_service.clients.rpc.time.sleep")
+    @patch("scoring_service.clients.rpc.httpx.Client")
+    def test_returns_none_on_non_object_body(
+        self, mock_client_cls, mock_sleep, client, caplog, body, logged
+    ):
+        mock_http = _mock_post(mock_client_cls, body)
+
+        with caplog.at_level("ERROR", logger="scoring_service.clients.rpc"):
+            result = client.fetch_manifest("nHkey")
+
+        assert result is None
+        assert _errors(caplog) == [f"RPC manifest returned a {logged}"]
+        # Terminal like an RPC error: no retry.
+        assert mock_http.post.call_count == 1
+        mock_sleep.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "manifest, type_name",
+        [
+            pytest.param({"x": 1}, "dict", id="manifest-dict"),
+            pytest.param(["a"], "list", id="manifest-list"),
+            pytest.param(7, "int", id="manifest-int"),
+            pytest.param("", "str", id="manifest-empty-string"),
+        ],
+    )
+    @patch("scoring_service.clients.rpc.httpx.Client")
+    def test_returns_none_on_non_string_manifest(
+        self, mock_client_cls, client, caplog, manifest, type_name
+    ):
+        _mock_post(mock_client_cls, {"result": {"manifest": manifest}})
+
+        with caplog.at_level("ERROR", logger="scoring_service.clients.rpc"):
+            result = client.fetch_manifest("nHkey")
+
+        assert result is None
+        assert _errors(caplog) == [
+            f"RPC manifest for nHkey is not a non-empty string ({type_name})"
+        ]
+
+    @patch("scoring_service.clients.rpc.httpx.Client")
+    def test_fetch_manifests_skips_key_with_non_object_body(self, mock_client_cls, client):
+        _mock_post(mock_client_cls, [])
+
+        assert client.fetch_manifests(["nHkey"]) == {}
+
 
 class TestFetchManifests:
     @patch.object(RPCClient, "fetch_manifest")
@@ -140,3 +211,18 @@ class TestIsReachable:
         mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
 
         assert client.is_reachable() is False
+
+    @pytest.mark.parametrize("body, logged", NON_OBJECT_BODIES)
+    @patch("scoring_service.clients.rpc.time.sleep")
+    @patch("scoring_service.clients.rpc.httpx.Client")
+    def test_false_on_non_object_body(
+        self, mock_client_cls, mock_sleep, client, caplog, body, logged
+    ):
+        mock_http = _mock_post(mock_client_cls, body)
+
+        with caplog.at_level("ERROR", logger="scoring_service.clients.rpc"):
+            assert client.is_reachable() is False
+
+        assert _errors(caplog) == [f"RPC server_info returned a {logged}"]
+        assert mock_http.post.call_count == 1
+        mock_sleep.assert_not_called()
