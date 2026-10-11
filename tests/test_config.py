@@ -141,6 +141,14 @@ def test_schedule_and_window_settings_accept_the_boundary_value(field, value):
     assert getattr(Settings(_env_file=None, **{field: value}), field) == value
 
 
+@pytest.mark.parametrize("value", [float("inf"), "inf", float("nan"), "nan", float("-inf")])
+def test_scoring_cadence_hours_rejects_non_finite_values(value):
+    # gt=0 alone admits +inf (timedelta(hours=inf) overflows at schedule seeding);
+    # the float field must be finite as well as positive.
+    with pytest.raises(ValidationError, match="scoring_cadence_hours"):
+        Settings(_env_file=None, scoring_cadence_hours=value)
+
+
 def test_schedule_and_window_defaults_are_unchanged():
     settings = Settings(_env_file=None)
     assert [getattr(settings, field) for field, _, _ in SCHEDULE_AND_WINDOW_BOUNDS] == [

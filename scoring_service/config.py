@@ -124,6 +124,7 @@ class Settings(BaseSettings):
     scoring_cadence_hours: float = Field(
         default=168,
         gt=0,
+        allow_inf_nan=False,
         description="Hours between scoring rounds (168 = weekly)",
     )
     scheduler_check_interval_seconds: int = Field(
