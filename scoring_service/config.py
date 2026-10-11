@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     )
     modal_request_timeout_seconds: int = Field(
         default=DEFAULT_MODAL_REQUEST_TIMEOUT_SECONDS,
+        gt=0,
         description="Modal scoring request timeout in seconds",
     )
 
@@ -170,6 +171,7 @@ class Settings(BaseSettings):
     )
     scoring_tp: int = Field(
         default=1,
+        ge=1,
         description="Tensor parallelism used by the Modal/SGLang scoring endpoint",
     )
     scoring_mem_fraction: str = Field(
@@ -182,6 +184,7 @@ class Settings(BaseSettings):
     )
     scoring_max_reqs: int = Field(
         default=1,
+        ge=1,
         description="Maximum concurrent SGLang requests configured for the scoring endpoint",
     )
     scoring_reasoning_parser: str = Field(
@@ -270,18 +273,23 @@ class Settings(BaseSettings):
     )
     convergence_ingestion_page_limit: int = Field(
         default=200,
+        ge=1,
         description="account_tx page size used by the convergence watcher",
     )
     convergence_ingestion_max_pages: int = Field(
         default=20,
+        ge=1,
         description="Maximum account_tx pages the convergence watcher reads per pass",
     )
     convergence_seal_grace_fraction: float = Field(
         default=0.5,
+        ge=0,
+        allow_inf_nan=False,
         description="Grace period after reveal-close before the convergence report seals, as a fraction of the reveal window",
     )
     convergence_seal_grace_floor_seconds: int = Field(
         default=120,
+        ge=0,
         description="Minimum grace period before the convergence report seals, regardless of reveal-window length",
     )
 
@@ -290,6 +298,8 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     unl_score_cutoff: int = Field(
         default=40,
+        ge=0,
+        le=100,
         description="Minimum score for a validator to be considered for the UNL",
     )
     unl_max_size: int = Field(
@@ -299,6 +309,7 @@ class Settings(BaseSettings):
     )
     unl_min_score_gap: int = Field(
         default=3,
+        ge=0,
         description="Minimum score margin a challenger needs over the weakest incumbent to displace them",
     )
 
@@ -311,6 +322,7 @@ class Settings(BaseSettings):
     )
     vl_expiration_days: int = Field(
         default=500,
+        ge=1,
         description="Days until a generated VL expires (safety net if service stops publishing)",
     )
     vl_effective_lookahead_hours: float = Field(
@@ -360,14 +372,17 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     http_request_timeout: int = Field(
         default=30,
+        gt=0,
         description="HTTP request timeout in seconds",
     )
     http_max_retries: int = Field(
         default=3,
+        ge=1,
         description="Maximum retry attempts for failed HTTP requests",
     )
     http_retry_base_delay: int = Field(
         default=2,
+        ge=0,
         description="Base delay in seconds for exponential backoff between retries",
     )
 
@@ -380,6 +395,8 @@ class Settings(BaseSettings):
     )
     default_page_limit: int = Field(
         default=20,
+        ge=1,
+        le=100,
         description="Default number of items per page for paginated API responses",
     )
 
