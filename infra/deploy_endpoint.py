@@ -19,6 +19,7 @@ import time
 
 import modal
 
+from .endpoint_settings import load_endpoint_settings
 from .model_revision import (
     expected_snapshot_path,
     find_cached_snapshot,
@@ -35,17 +36,20 @@ GPU_TYPE = os.environ.get("SCORING_GPU_TYPE", "H100")
 QUANTIZATION = os.environ.get("SCORING_QUANTIZATION", "")
 ATTENTION_BACKEND = os.environ.get("SCORING_ATTENTION_BACKEND", "")
 REASONING_PARSER = os.environ.get("SCORING_REASONING_PARSER", "qwen3")
-TENSOR_PARALLEL = int(os.environ.get("SCORING_TP", "1"))
-MAX_CONTAINERS = int(os.environ.get("SCORING_MAX_CONTAINERS", "3"))
+# Numeric settings are range-checked in endpoint_settings.py; an out-of-range
+# value raises ValueError here instead of reaching SGLang or Modal.
+ENDPOINT_SETTINGS = load_endpoint_settings(os.environ)
+TENSOR_PARALLEL = ENDPOINT_SETTINGS.tensor_parallel
+MAX_CONTAINERS = ENDPOINT_SETTINGS.max_containers
 # Share of GPU memory reserved for model weights and KV cache (0.75 = 75%).
 # Lower than default 0.90 to leave room for full scoring prompts and runtime workspace.
-MEM_FRACTION_STATIC = float(os.environ.get("SCORING_MEM_FRACTION", "0.75"))
+MEM_FRACTION_STATIC = ENDPOINT_SETTINGS.mem_fraction_static
 # Process input tokens in chunks of this size instead of all at once.
 # Keeps peak memory stable for the ~8K-token scoring prompt.
-CHUNKED_PREFILL_SIZE = int(os.environ.get("SCORING_CHUNKED_PREFILL", "4096"))
+CHUNKED_PREFILL_SIZE = ENDPOINT_SETTINGS.chunked_prefill_size
 # Max concurrent requests the server will handle.
 # Low value prevents OOM when each request allocates its own temporary GPU state.
-MAX_RUNNING_REQUESTS = int(os.environ.get("SCORING_MAX_REQS", "1"))
+MAX_RUNNING_REQUESTS = ENDPOINT_SETTINGS.max_running_requests
 PRELOAD_MODEL = os.environ.get("SCORING_PRELOAD_MODEL", "0") != "0"
 COMPILE_DEEPGEMM = os.environ.get("SCORING_COMPILE_DEEPGEMM", "1") != "0"
 COMPILE_GPU_TYPE = os.environ.get("SCORING_COMPILE_GPU_TYPE", GPU_TYPE)
@@ -241,16 +245,11 @@ class ScoringEndpoint:
         quantization = os.environ.get("SCORING_QUANTIZATION", QUANTIZATION)
         attention_backend = os.environ.get("SCORING_ATTENTION_BACKEND", ATTENTION_BACKEND)
         reasoning_parser = os.environ.get("SCORING_REASONING_PARSER", REASONING_PARSER)
-        tensor_parallel = int(os.environ.get("SCORING_TP", str(TENSOR_PARALLEL)))
-        mem_fraction_static = float(
-            os.environ.get("SCORING_MEM_FRACTION", str(MEM_FRACTION_STATIC))
-        )
-        chunked_prefill_size = int(
-            os.environ.get("SCORING_CHUNKED_PREFILL", str(CHUNKED_PREFILL_SIZE))
-        )
-        max_running_requests = int(
-            os.environ.get("SCORING_MAX_REQS", str(MAX_RUNNING_REQUESTS))
-        )
+        settings = load_endpoint_settings(os.environ, defaults=ENDPOINT_SETTINGS)
+        tensor_parallel = settings.tensor_parallel
+        mem_fraction_static = settings.mem_fraction_static
+        chunked_prefill_size = settings.chunked_prefill_size
+        max_running_requests = settings.max_running_requests
         model_path = (
             download_model(model_id, model_revision) if model_revision else model_id
         )
