@@ -101,3 +101,54 @@ def test_minimum_safe_version_is_read_from_the_environment(monkeypatch):
     monkeypatch.setenv("MINIMUM_SAFE_VERSION", "1.0.8")
 
     assert Settings(_env_file=None).minimum_safe_version == "1.0.8"
+
+
+# Settings whose zero or negative values used to load and only misbehave later:
+# a non-positive cadence makes every round due immediately after the previous
+# attempt, a non-positive check or poll interval turns the scheduler and
+# ingestion loops into hot loops, and non-positive announcement windows only
+# fail inside compute_round_windows after the input package has been built.
+# (field, lowest accepted value, rejected values)
+SCHEDULE_AND_WINDOW_BOUNDS = [
+    ("scoring_cadence_hours", 0.5, [0, -1]),
+    ("scheduler_check_interval_seconds", 1, [0, -1]),
+    ("scheduler_startup_delay_seconds", 0, [-1]),
+    ("convergence_ingestion_poll_interval_seconds", 1, [0, -1]),
+    ("convergence_ingestion_startup_delay_seconds", 0, [-1]),
+    ("announcement_commit_window_seconds", 1, [0, -1]),
+    ("announcement_reveal_window_seconds", 1, [0, -1]),
+    ("announcement_reveal_gap_seconds", 0, [-1]),
+    ("output_publication_delay_seconds", 0, [-1]),
+    ("scoring_max_tokens", 1, [0, -1]),
+    ("scoring_temperature", 0, [-1]),
+]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [(field, value) for field, _, rejected in SCHEDULE_AND_WINDOW_BOUNDS for value in rejected],
+)
+def test_schedule_and_window_settings_reject_out_of_range_values(field, value):
+    with pytest.raises(ValidationError, match=field):
+        Settings(_env_file=None, **{field: value})
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [(field, lowest) for field, lowest, _ in SCHEDULE_AND_WINDOW_BOUNDS],
+)
+def test_schedule_and_window_settings_accept_the_boundary_value(field, value):
+    assert getattr(Settings(_env_file=None, **{field: value}), field) == value
+
+
+def test_schedule_and_window_defaults_are_unchanged():
+    settings = Settings(_env_file=None)
+    assert [getattr(settings, field) for field, _, _ in SCHEDULE_AND_WINDOW_BOUNDS] == [
+        168, 300, 300, 240, 60, 10800, 7200, 0, 15, 16384, 0,
+    ]
+
+
+def test_out_of_range_schedule_settings_are_rejected_from_the_environment(monkeypatch):
+    monkeypatch.setenv("SCHEDULER_CHECK_INTERVAL_SECONDS", "0")
+    with pytest.raises(ValidationError, match="scheduler_check_interval_seconds"):
+        Settings(_env_file=None)

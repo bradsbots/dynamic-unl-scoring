@@ -123,14 +123,17 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     scoring_cadence_hours: float = Field(
         default=168,
+        gt=0,
         description="Hours between scoring rounds (168 = weekly)",
     )
     scheduler_check_interval_seconds: int = Field(
         default=300,
+        ge=1,
         description="How often the scheduler checks if a round is due (300 = every 5 minutes)",
     )
     scheduler_startup_delay_seconds: int = Field(
         default=300,
+        ge=0,
         description="Seconds to wait after service boot before first schedule check",
     )
     scoring_model_id: str = Field(
@@ -198,10 +201,12 @@ class Settings(BaseSettings):
     )
     scoring_temperature: int = Field(
         default=0,
+        ge=0,
         description="LLM sampling temperature (0 = deterministic)",
     )
     scoring_max_tokens: int = Field(
         default=16384,
+        ge=1,
         description="Maximum tokens in LLM response",
     )
     scoring_memo_type: str = Field(
@@ -230,18 +235,22 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     announcement_commit_window_seconds: int = Field(
         default=10800,
+        ge=1,
         description="Seconds the commit window stays open in the on-chain round announcement",
     )
     announcement_reveal_window_seconds: int = Field(
         default=7200,
+        ge=1,
         description="Seconds the reveal window stays open in the on-chain round announcement",
     )
     announcement_reveal_gap_seconds: int = Field(
         default=0,
+        ge=0,
         description="Seconds between commit window close and reveal window open in the round announcement",
     )
     output_publication_delay_seconds: int = Field(
         default=15,
+        ge=0,
         description=(
             "Safety margin after commit close before publishing final output "
             "artifacts. Output serving is gated by commit close; this delay "
@@ -258,10 +267,12 @@ class Settings(BaseSettings):
     )
     convergence_ingestion_poll_interval_seconds: int = Field(
         default=240,
+        ge=1,
         description="How often the convergence watcher scans for new commit/reveal memos",
     )
     convergence_ingestion_startup_delay_seconds: int = Field(
         default=60,
+        ge=0,
         description="Seconds to wait after service boot before the first ingestion pass",
     )
     convergence_ingestion_start_ledger: int = Field(
