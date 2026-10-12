@@ -40,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/scoring")
 
+# PostgreSQL OFFSET is a bigint; a larger value fails in the query with "bigint out of range".
+MAX_PAGE_OFFSET = 2**63 - 1
+
 WALLET_CACHE_TTL_SECONDS = 30
 WALLET_MIN_BALANCE_DROPS = 10 * DROPS_PER_PFT
 
@@ -182,7 +185,7 @@ def trigger_round(
 @router.get("/rounds")
 def list_rounds(
     limit: int = Query(default=settings.default_page_limit, ge=1, le=100),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=MAX_PAGE_OFFSET),
 ):
     """List recent scoring rounds, newest first."""
     connection = get_db()

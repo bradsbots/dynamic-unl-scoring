@@ -2,6 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 from fastapi import status
 
 
@@ -48,6 +49,48 @@ class TestAdminDryRuns:
         assert data["limit"] == 5
         assert data["offset"] == 10
         conn.close.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "offset",
+        ["9223372036854775808", pytest.param("9" * 400, id="9x400"), "-1", "1.5", "abc"],
+    )
+    def test_rejects_offset_outside_bigint_range(self, client, offset):
+        with (
+            patch("scoring_service.api._helpers.settings") as mock_settings,
+            patch("scoring_service.api.admin.get_db") as mock_get_db,
+            patch("scoring_service.api.admin.list_dry_runs") as mock_list,
+        ):
+            mock_settings.admin_api_key = "the_key"
+
+            response = client.get(
+                f"/api/scoring/admin/dry-runs?offset={offset}",
+                headers={"X-API-Key": "the_key"},
+            )
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
+        assert response.json()["detail"][0]["loc"] == ["query", "offset"]
+        mock_get_db.assert_not_called()
+        mock_list.assert_not_called()
+
+    @pytest.mark.parametrize("offset", [0, 5, 9223372036854775807])
+    def test_accepts_offset_within_bigint_range(self, client, offset):
+        conn = MagicMock()
+
+        with (
+            patch("scoring_service.api._helpers.settings") as mock_settings,
+            patch("scoring_service.api.admin.get_db", return_value=conn),
+            patch("scoring_service.api.admin.list_dry_runs", return_value=([], 0)) as mock_list,
+        ):
+            mock_settings.admin_api_key = "the_key"
+
+            response = client.get(
+                f"/api/scoring/admin/dry-runs?offset={offset}",
+                headers={"X-API-Key": "the_key"},
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["offset"] == offset
+        mock_list.assert_called_once_with(conn, 20, offset)
 
     def test_gets_private_dry_run_detail(self, client):
         conn = MagicMock()

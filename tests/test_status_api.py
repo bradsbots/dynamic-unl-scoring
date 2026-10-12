@@ -92,6 +92,32 @@ class TestListRounds:
         assert data["limit"] == 5
         assert data["offset"] == 10
 
+    @pytest.mark.parametrize(
+        "offset",
+        ["9223372036854775808", pytest.param("9" * 400, id="9x400"), "-1", "1.5", "abc"],
+    )
+    def test_rejects_offset_outside_bigint_range(self, client, offset):
+        conn = _mock_db_with_rows([], total=0)
+
+        with patch("scoring_service.api.scoring.get_db", return_value=conn):
+            response = client.get(f"/api/scoring/rounds?offset={offset}")
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
+        assert response.json()["detail"][0]["loc"] == ["query", "offset"]
+        conn.cursor.assert_not_called()
+
+    @pytest.mark.parametrize("offset", [0, 5, 9223372036854775807])
+    def test_accepts_offset_within_bigint_range(self, client, offset):
+        conn = _mock_db_with_rows([], total=0)
+
+        with patch("scoring_service.api.scoring.get_db", return_value=conn):
+            response = client.get(f"/api/scoring/rounds?offset={offset}")
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["offset"] == offset
+        params = conn.cursor.return_value.execute.call_args_list[0].args[1]
+        assert params[-1] == offset
+
     def test_empty_results(self, client):
         conn = _mock_db_with_rows([], total=0)
 

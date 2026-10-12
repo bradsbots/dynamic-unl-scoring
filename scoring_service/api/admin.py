@@ -18,6 +18,7 @@ from scoring_service.api._helpers import (
     check_admin_auth,
     release_round_lock,
 )
+from scoring_service.api.scoring import MAX_PAGE_OFFSET
 from scoring_service.api.schemas import (
     PublishCustomUNLRequest,
     PublishFromRoundRequest,
@@ -40,7 +41,7 @@ router = APIRouter(prefix="/api/scoring")
 @router.get("/admin/dry-runs")
 def list_admin_dry_runs(
     limit: int = Query(default=20, ge=1, le=100),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=MAX_PAGE_OFFSET),
     x_api_key: str | None = Header(default=None),
 ):
     """List private dry-runs for admin review."""
