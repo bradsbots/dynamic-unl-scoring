@@ -7,6 +7,8 @@ import pytest
 
 from scoring_service.clients.vhs import VHSClient, VHSRequestError, _parse_validator
 from scoring_service.constants import PEER_PROTOCOL_PORT
+from scoring_service.server_version import parse_release_version
+from scoring_service.services.collector import check_minimum_safe_version
 
 
 VHS_VALIDATOR_RESPONSE = {
@@ -142,6 +144,61 @@ class TestParseValidator:
         assert v.agreement_1h.missed is None
         assert v.agreement_24h.score is None
         assert v.agreement_30d.score is None
+
+
+MINIMUM_SAFE_VERSION = parse_release_version("1.0.9")
+
+UNREADABLE_SERVER_VERSIONS = [
+    pytest.param(None, id="null"),
+    pytest.param(109, id="int"),
+    pytest.param(1.09, id="float"),
+    pytest.param(["1.0.9"], id="list"),
+    pytest.param({"v": "1.0.9"}, id="dict"),
+    pytest.param(True, id="bool"),
+]
+
+
+class TestParseServerVersion:
+    @pytest.mark.parametrize(
+        ("raw_version", "parsed", "fails_minimum"),
+        [
+            ("1.0.9", "1.0.9", False),
+            ("v1.0.9", "v1.0.9", True),
+            ("1.0.10", "1.0.10", False),
+        ],
+    )
+    def test_string_version_is_kept(self, raw_version, parsed, fails_minimum):
+        v = _parse_validator({"master_key": "nHBtest", "signing_key": "n9test", "server_version": raw_version})
+        assert v.server_version == parsed
+        check_minimum_safe_version([v], MINIMUM_SAFE_VERSION)
+        assert v.fails_minimum_safe_version is fails_minimum
+
+    def test_missing_version_parses_as_empty(self):
+        v = _parse_validator({"master_key": "nHBtest", "signing_key": "n9test"})
+        assert v.server_version == ""
+
+    @pytest.mark.parametrize("raw_version", UNREADABLE_SERVER_VERSIONS)
+    def test_non_string_version_parses_as_empty(self, raw_version):
+        v = _parse_validator({"master_key": "nHBtest", "signing_key": "n9test", "server_version": raw_version})
+        assert v.server_version == ""
+
+    @pytest.mark.parametrize("raw_version", UNREADABLE_SERVER_VERSIONS)
+    def test_non_string_version_fails_minimum_safe_version(self, raw_version):
+        v = _parse_validator({"master_key": "nHBtest", "signing_key": "n9test", "server_version": raw_version})
+        assert check_minimum_safe_version([v], MINIMUM_SAFE_VERSION) == 1
+        assert v.fails_minimum_safe_version is True
+
+    @pytest.mark.parametrize("raw_version", UNREADABLE_SERVER_VERSIONS)
+    @patch("scoring_service.clients.vhs._request_with_retry")
+    def test_non_string_version_does_not_abort_fetch(self, mock_request, raw_version):
+        good = {**VHS_VALIDATOR_RESPONSE["validators"][0], "server_version": "1.0.9"}
+        bad = {**VHS_VALIDATOR_RESPONSE["validators"][1], "server_version": raw_version}
+        mock_request.return_value = {"validators": [good, bad]}
+        client = VHSClient(base_url="https://vhs.test.postfiat.org")
+        validators, _raw = client.fetch_validators()
+        assert [v.server_version for v in validators] == ["1.0.9", ""]
+        assert check_minimum_safe_version(validators, MINIMUM_SAFE_VERSION) == 1
+        assert [v.fails_minimum_safe_version for v in validators] == [False, True]
 
 
 class TestFetchValidators:

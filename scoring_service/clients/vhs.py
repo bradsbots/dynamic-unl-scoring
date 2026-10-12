@@ -57,6 +57,11 @@ def _parse_validator(raw: dict) -> ValidatorProfile:
     unl_value = raw.get("unl", False)
     unl = bool(unl_value)
 
+    # A version that is not a string is unreadable; it parses as "" and so
+    # fails the minimum safe version instead of aborting the whole fetch.
+    sv = raw.get("server_version")
+    server_version = sv.strip() if isinstance(sv, str) else ""
+
     return ValidatorProfile(
         master_key=master_key,
         signing_key=signing_key,
@@ -65,7 +70,7 @@ def _parse_validator(raw: dict) -> ValidatorProfile:
         agreement_1h=_parse_agreement(raw.get("agreement_1h", {})),
         agreement_24h=_parse_agreement(raw.get("agreement_24h", {})),
         agreement_30d=_parse_agreement(raw.get("agreement_30day", {})),
-        server_version=raw.get("server_version", ""),
+        server_version=server_version,
         unl=unl,
         base_fee=raw.get("base_fee"),
     )
