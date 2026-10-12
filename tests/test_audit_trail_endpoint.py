@@ -2,8 +2,11 @@
 
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
+from urllib.parse import unquote
 
+import pytest
 from fastapi import status
+from fastapi.testclient import TestClient
 
 from scoring_service.api._helpers import round_outputs_available
 from scoring_service.services.orchestrator import RoundState
@@ -241,3 +244,148 @@ class TestServeInputPackageFile:
         query_params = mock_cursor.execute.call_args.args[1]
         assert "status != %s" in query_sql
         assert query_params == (1, "DRY_RUN_COMPLETE")
+
+
+def _nul_rejecting_conn(fetchone_value):
+    """Mock connection whose cursor refuses NUL in string params, as psycopg2 does."""
+    conn = MagicMock()
+    cursor = MagicMock()
+    conn.cursor.return_value = cursor
+
+    def execute(sql, params=None):
+        for param in params or ():
+            if isinstance(param, str) and "\x00" in param:
+                raise ValueError(
+                    "A string literal cannot contain NUL (0x00) characters."
+                )
+
+    cursor.execute.side_effect = execute
+    cursor.fetchone.return_value = fetchone_value
+    return conn
+
+
+class TestNulBytePaths:
+    """A NUL byte in file_path can never match a stored row (Postgres text
+    cannot hold NUL), so both public file routes answer their usual 404
+    without opening a database connection."""
+
+    @pytest.fixture
+    def lenient_client(self, client):
+        return TestClient(client.app, raise_server_exceptions=False)
+
+    @pytest.mark.parametrize(
+        "raw_path",
+        [
+            "scores.json%00",
+            "%00",
+            "%00scores.json",
+            "sco%00res.json",
+            "outputs/%00/x.json",
+        ],
+    )
+    def test_audit_trail_nul_path_returns_404_without_db(
+        self, lenient_client, raw_path
+    ):
+        conn = _nul_rejecting_conn(({"ok": 1},))
+
+        with (
+            patch(
+                "scoring_service.api.audit_trail.get_db", return_value=conn
+            ) as get_db,
+            patch(
+                "scoring_service.api.audit_trail.round_outputs_available",
+                return_value=True,
+            ),
+        ):
+            response = lenient_client.get(f"/api/scoring/rounds/1/{raw_path}")
+
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+        assert response.json() == {
+            "error": f"File not found: round 1, path {unquote(raw_path)}"
+        }
+        get_db.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "raw_path",
+        [
+            "validators.json%00",
+            "%00",
+            "%00validators.json",
+            "vali%00dators.json",
+            "inputs/%00/x.json",
+        ],
+    )
+    def test_input_package_nul_path_returns_404_without_db(
+        self, lenient_client, raw_path
+    ):
+        conn = _nul_rejecting_conn(({"ok": 1},))
+
+        with (
+            patch(
+                "scoring_service.api.audit_trail.get_db", return_value=conn
+            ) as get_db,
+            patch(
+                "scoring_service.api.audit_trail.public_round_exists",
+                return_value=True,
+            ),
+        ):
+            response = lenient_client.get(
+                f"/api/scoring/rounds/1/input/{raw_path}"
+            )
+
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+        assert response.json() == {
+            "error": (
+                "Input package file not found: round 1, "
+                f"path {unquote(raw_path)}"
+            )
+        }
+        get_db.assert_not_called()
+
+    def test_audit_trail_normal_path_still_reaches_query(self, lenient_client):
+        conn = _nul_rejecting_conn(({"ok": 1},))
+
+        with (
+            patch(
+                "scoring_service.api.audit_trail.get_db", return_value=conn
+            ) as get_db,
+            patch(
+                "scoring_service.api.audit_trail.round_outputs_available",
+                return_value=True,
+            ),
+        ):
+            response = lenient_client.get("/api/scoring/rounds/1/scores.json")
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json() == {"ok": 1}
+        get_db.assert_called_once()
+        assert conn.cursor.return_value.execute.call_args.args[1] == (
+            1,
+            "scores.json",
+        )
+        conn.close.assert_called_once()
+
+    def test_input_package_normal_path_still_reaches_query(self, lenient_client):
+        conn = _nul_rejecting_conn(({"ok": 1},))
+
+        with (
+            patch(
+                "scoring_service.api.audit_trail.get_db", return_value=conn
+            ) as get_db,
+            patch(
+                "scoring_service.api.audit_trail.public_round_exists",
+                return_value=True,
+            ),
+        ):
+            response = lenient_client.get(
+                "/api/scoring/rounds/1/input/validators.json"
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json() == {"ok": 1}
+        get_db.assert_called_once()
+        assert conn.cursor.return_value.execute.call_args.args[1] == (
+            1,
+            "validators.json",
+        )
+        conn.close.assert_called_once()
