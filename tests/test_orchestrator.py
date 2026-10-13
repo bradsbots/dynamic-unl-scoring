@@ -16,6 +16,7 @@ from scoring_service.services.orchestrator import (
     _next_round_number,
     _update_round,
 )
+from scoring_service.models import ValidatorProfile
 from scoring_service.services.ipfs_publisher import InputPackagePublication
 from scoring_service.services.response_parser import ScoringResult, ValidatorScore
 from scoring_service.services.unl_selector import UNLSelectionResult
@@ -57,6 +58,16 @@ def _make_scoring_result(complete=True, validator_count=2):
     )
 
 
+def _make_diversity_inputs(validator_count=2):
+    return {
+        "resolved_endpoints": validator_count,
+        "validators": [
+            {"master_key": f"nHU_key_{i}", "country_validators": 1, "provider_validators": 1}
+            for i in range(validator_count)
+        ],
+    }
+
+
 def _make_unl_result():
     return UNLSelectionResult(
         unl=["nHU_key_0", "nHU_key_1"],
@@ -67,6 +78,11 @@ def _make_unl_result():
 def _mock_snapshot():
     snapshot = MagicMock()
     snapshot.content_hash.return_value = "abc123hash"
+    # Dry runs build the diversity inputs from the live snapshot's validators.
+    snapshot.validators = [
+        ValidatorProfile(master_key=f"nHU_key_{i}", signing_key=f"n9_key_{i}")
+        for i in range(2)
+    ]
     return snapshot
 
 
@@ -98,6 +114,7 @@ def _make_input_package(
         model_request=model_request or INPUT_MODEL_REQUEST,
         validator_id_map=validator_id_map or INPUT_VALIDATOR_ID_MAP,
         previous_unl=previous_unl or [],
+        diversity_inputs=_make_diversity_inputs(),
         files={
             "bundle.json": {
                 "package_kind": "input",
@@ -106,6 +123,7 @@ def _make_input_package(
             "inputs/model_request.json": model_request or INPUT_MODEL_REQUEST,
             "inputs/validator_map.json": validator_id_map or INPUT_VALIDATOR_ID_MAP,
             "inputs/validator_evidence.json": {"validators": []},
+            "inputs/diversity_inputs.json": _make_diversity_inputs(),
             "runtime/execution_manifest.json": {"schema_version": 1},
         },
     )
@@ -334,18 +352,28 @@ class TestRunRoundHappyPath:
         ]
         # ...and selection consumes the package's frozen value, not a live re-read.
         assert mock_select.call_args.args[1] == ["nHU_frozen_prev"]
-        # Selection consumes deterministic final scores — sub-scores
-        # (85, 80, 75, 70, 65) yield weighted_sum 79 with the gate not binding —
-        # while the parsed result keeps the model's advisory scores (80, 81).
+        # Selection consumes the computed diversity (100 for a validator alone
+        # on both axes, replacing the model's 70) and the deterministic final
+        # score — sub-scores (85, 80, 75, 100, 65) yield weighted_sum 82 with
+        # the gate not binding — while the parsed result keeps the model's
+        # advisory scores (80, 81).
+        assert [
+            v.diversity for v in mock_select.call_args.args[0].validator_scores
+        ] == [100, 100]
         assert [
             v.score for v in mock_select.call_args.args[0].validator_scores
-        ] == [79, 79]
+        ] == [82, 82]
         assert [
             v.score for v in mock_parse.return_value.validator_scores
         ] == [80, 81]
         mock_modal.score_request.assert_called_once_with(INPUT_MODEL_REQUEST)
         mock_modal.score.assert_not_called()
-        mock_rpc.fetch_manifests.assert_called_once()
+        # Once to remember the snapshot's unknown manifests after collection,
+        # once more to resolve them fresh at signing.
+        assert mock_rpc.fetch_manifests.call_args_list == [
+            call(["nHU_key_0", "nHU_key_1"]),
+            call(["nHU_key_0", "nHU_key_1"]),
+        ]
         mock_ipfs.publish.assert_not_called()
         mock_github_pages.publish.assert_not_called()
         mock_onchain.publish.assert_not_called()
@@ -856,6 +884,9 @@ class TestDryRun:
         mock_modal = MagicMock()
         mock_modal.score.return_value = '{"test": true}'
         mock_rpc = MagicMock()
+        mock_rpc.fetch_manifests.return_value = {"nHU_key_0": "manifest0"}
+        conn = mock_get_db.return_value
+        conn.cursor.return_value.fetchall.return_value = []
         mock_ipfs = MagicMock()
         mock_onchain = MagicMock()
 
@@ -884,7 +915,20 @@ class TestDryRun:
         assert dry_run_kwargs["validator_id_map"] == {
             "v001": {"master_key": "key", "signing_key": "signing_key"}
         }
-        mock_rpc.fetch_manifests.assert_not_called()
+        # The dry run checks manifest availability for the selected UNL but
+        # never signs: one RPC lookup, no VL, and the outcome is recorded.
+        mock_rpc.fetch_manifests.assert_called_once_with(["nHU_key_0", "nHU_key_1"])
+        assert result["manifest_check"] == {
+            "from_rpc": ["nHU_key_0"],
+            "from_store": [],
+            "missing": ["nHU_key_1"],
+        }
+        recorded = [
+            c.kwargs["manifest_check"]
+            for c in mock_update.call_args_list
+            if "manifest_check" in c.kwargs
+        ]
+        assert recorded == ['{"from_rpc": ["nHU_key_0"], "from_store": [], "missing": ["nHU_key_1"]}']
         mock_ipfs.publish.assert_not_called()
         mock_onchain.publish.assert_not_called()
 
@@ -933,9 +977,56 @@ class TestDryRun:
 
         assert result["status"] == RoundState.FAILED.value
         assert "DRY_RUN_ARTIFACTS" in mock_fail.call_args[0][2]
-        mock_rpc.fetch_manifests.assert_not_called()
+        mock_rpc.fetch_manifests.assert_called_once()
         mock_ipfs.publish.assert_not_called()
         mock_onchain.publish.assert_not_called()
+
+    @patch("scoring_service.services.orchestrator.resolve_manifests")
+    @patch("scoring_service.services.orchestrator.get_db")
+    @patch("scoring_service.services.orchestrator.select_unl")
+    @patch("scoring_service.services.orchestrator.parse_response")
+    @patch("scoring_service.services.orchestrator._get_previous_unl")
+    @patch("scoring_service.services.orchestrator.update_dry_run")
+    @patch("scoring_service.services.orchestrator.settings")
+    def test_manifest_check_failure_rolls_back_and_does_not_fail_dry_run(
+        self, mock_settings, mock_update, mock_prev_unl, mock_parse,
+        mock_select, mock_get_db, mock_resolve,
+    ):
+        mock_settings.pftl_network = "testnet"
+        mock_prev_unl.return_value = None
+        mock_parse.return_value = _make_scoring_result()
+        mock_select.return_value = _make_unl_result()
+        conn = MagicMock()
+        mock_get_db.return_value = conn
+        mock_resolve.side_effect = Exception("db fault")
+
+        mock_collector = MagicMock()
+        mock_collector.collect_dry_run.return_value = (
+            _mock_snapshot(),
+            {"vhs_validators": {"validators": []}},
+        )
+        mock_prompt = MagicMock()
+        mock_prompt.build.return_value = ([], {})
+        mock_modal = MagicMock()
+        mock_modal.score.return_value = '{"test": true}'
+
+        orchestrator = ScoringOrchestrator(
+            collector=mock_collector,
+            prompt_builder=mock_prompt,
+            modal_client=mock_modal,
+            rpc_client=MagicMock(),
+            ipfs_publisher=MagicMock(),
+            onchain_publisher=MagicMock(),
+            github_pages_client=MagicMock(),
+        )
+
+        result = orchestrator.run_dry_run(dry_run_id=123)
+
+        # The aborted transaction is rolled back so the artifact step still
+        # works, and the dry run completes without a manifest check.
+        conn.rollback.assert_called_once()
+        assert result["status"] == RoundState.DRY_RUN_COMPLETE.value
+        assert "manifest_check" not in result
 
     @patch("scoring_service.services.orchestrator.ScoringOrchestrator.run_dry_run")
     @patch("scoring_service.services.orchestrator._create_round")
@@ -1317,7 +1408,7 @@ class TestFailureAtEachState:
         mock_reserve.return_value = 1
         mock_gen_vl.return_value = SAMPLE_VL
         rpc = MagicMock()
-        rpc.fetch_manifests.return_value = {"key": "manifest"}
+        rpc.fetch_manifests.return_value = {"nHU_key_0": "manifest", "nHU_key_1": "manifest"}
         ipfs = MagicMock()
         ipfs.publish_input_package.return_value = _make_input_package()
         ipfs.publish.return_value = None  # IPFS failed
@@ -1370,7 +1461,7 @@ class TestFailureAtEachState:
         mock_reserve.return_value = 1
         mock_gen_vl.return_value = SAMPLE_VL
         rpc = MagicMock()
-        rpc.fetch_manifests.return_value = {"key": "manifest"}
+        rpc.fetch_manifests.return_value = {"nHU_key_0": "manifest", "nHU_key_1": "manifest"}
         ipfs = MagicMock()
         ipfs.publish_input_package.return_value = _make_input_package()
         ipfs.publish.return_value = "QmCID"
@@ -1431,7 +1522,7 @@ class TestFailureAtEachState:
         mock_reserve.return_value = 1
         mock_gen_vl.return_value = SAMPLE_VL
         rpc = MagicMock()
-        rpc.fetch_manifests.return_value = {"key": "manifest"}
+        rpc.fetch_manifests.return_value = {"nHU_key_0": "manifest", "nHU_key_1": "manifest"}
         ipfs = MagicMock()
         ipfs.publish_input_package.return_value = _make_input_package()
         ipfs.publish.return_value = "QmCID"

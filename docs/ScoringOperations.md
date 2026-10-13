@@ -82,10 +82,11 @@ Normal rounds first publish a frozen input package, then score from that exact p
 | `inputs/validator_evidence.json` | Normalized validator evidence used to render the prompt, including keys/IPs for audit |
 | `inputs/model_request.json` | Exact OpenAI-compatible request payload sent to the scoring model |
 | `inputs/validator_map.json` | Anonymous prompt IDs mapped to validator master and signing keys |
+| `inputs/diversity_inputs.json` | Per-validator country and provider-family counts and the resolved-endpoint total that diversity formula v1 reads (see `docs/DeterministicDiversity.md`) |
 | `runtime/execution_manifest.json` | Model, runtime, request, code, collector exclusion policy and minimum safe version, and canonicalization contract for this execution |
 | `outputs/model_response.json` | Raw unparsed model response consumed by the response parser |
 | `outputs/validator_scores.json` | Parsed LLM output: advisory overall + 5 dimension scores, per-validator reasoning, network summary |
-| `outputs/final_scores.json` | Deterministic final scores computed from the sub-scores by score formula v1, with the formula parameters; the scores selection consumes (see `docs/DeterministicFinalScore.md`) |
+| `outputs/final_scores.json` | Deterministic final scores computed from the sub-scores by score formula v1, with the formula parameters; the scores selection consumes (see `docs/DeterministicFinalScore.md`). Since diversity formula v1 each entry also carries the model's advisory `model_diversity` and the computed `diversity` that fed the formula (see `docs/DeterministicDiversity.md`) |
 | `outputs/selected_unl.json` | Selected UNL validators + alternates |
 | `outputs/signed_validator_list.json` | Signed Validator List (v2 format, served at `/vl.json`); not present for dry-runs |
 | `outputs/verification_hashes.json` | Canonical SHA-256 hashes for verifier-relevant output files present in the bundle |
@@ -144,7 +145,7 @@ curl -X POST "https://scoring-testnet.postfiat.org/api/scoring/trigger?dry_run=t
   -H "X-API-Key: <TESTNET_ADMIN_API_KEY>"
 ```
 
-Returns `202 Accepted` with `{"dry_run": true, "dry_run_id": <ID>, "status": "started"}`. Dry-runs never touch the schedule, so `reanchor` is not required and is ignored if supplied. They do not reserve a public round number, reserve a VL sequence, fetch manifests, sign a VL, pin to IPFS, update GitHub Pages, or publish an on-chain memo. They do store the same staged review bundle as normal rounds, without `outputs/signed_validator_list.json`.
+Returns `202 Accepted` with `{"dry_run": true, "dry_run_id": <ID>, "status": "started"}`. Dry-runs never touch the schedule, so `reanchor` is not required and is ignored if supplied. They do not reserve a public round number, reserve a VL sequence, sign a VL, pin to IPFS, update GitHub Pages, or publish an on-chain memo. They do store the same staged review bundle as normal rounds, without `outputs/signed_validator_list.json`, and they check that a manifest is available for every selected validator (RPC node first, then the service's own manifest store), recording the outcome as `manifest_check` (`from_rpc`, `from_store`, `missing`) on the dry-run row served by `GET /api/scoring/admin/dry-runs/{id}`. A non-empty `missing` list means the real round would fail at `VL_SIGNED`.
 
 ---
 
@@ -398,9 +399,17 @@ Choose one of three responses:
 
 ---
 
+## Refresh the ASN Routing Table
+
+Validator IPs are resolved to providers with the pyasn table in `data/asn/` (`ipasn_<date>.dat` plus `asnames.json`), built from a public RouteViews snapshot. Prefix allocations move, and an IP the table does not know gets no provider, which diversity formula v1 scores as an unknown axis (10 points instead of up to 50). The collector logs `validator IP(s) could not be mapped to an ASN ... refresh the ASN table` when that happens.
+
+The `refresh-asn-table.yml` workflow runs on the first of every month (and on demand from the Actions tab): it downloads the latest snapshot, converts it, refreshes the AS names, swaps the dated file in, updates every reference, and opens a pull request. Review and merge it, then deploy devnet and testnet as usual, not while a round is between input freeze and publication. `python scripts/refresh_asn_table.py` does the same by hand.
+
+---
+
 ## Raise the Minimum Safe Version
 
-`MINIMUM_SAFE_VERSION` is the oldest `postfiatd` release without a known security hole. The collector compares every validator's `server_version` against it and writes the result into the validator's evidence as `fails_minimum_safe_version`; scoring prompt v11 then sets the software sub-score of every validator that fails it to 0. The validator is still scored, stays visible in the round, and can still hold a UNL seat when too few safe validators exist to fill the list, so the rule never shrinks the UNL. A validator that reports no readable version cannot be shown to be safe, so it fails the minimum too. An empty value disables the rule.
+`MINIMUM_SAFE_VERSION` is the oldest `postfiatd` release without a known security hole. The collector compares every validator's `server_version` against it and writes the result into the validator's evidence as `fails_minimum_safe_version`; since scoring prompt v11 the model sets the software sub-score of every validator that fails it to 0. The validator is still scored, stays visible in the round, and can still hold a UNL seat when too few safe validators exist to fill the list, so the rule never shrinks the UNL. A validator that reports no readable version cannot be shown to be safe, so it fails the minimum too. An empty value disables the rule.
 
 Raise it after every `postfiatd` release that closes a security hole:
 
@@ -419,6 +428,8 @@ Each round records the value it ran with in `runtime/execution_manifest.json` un
 **Modal proxy auth:** Scoring API callers only use the scoring service admin key. They do not send Modal auth headers. The scoring service authenticates to Modal internally with `MODAL_KEY` and `MODAL_SECRET`; local direct-endpoint scripts read those same variable names from `.env` or the shell environment when you need to test Modal itself.
 
 **Scoring cadence:** The built-in scheduler checks every 5 minutes whether the persisted `round_schedule.next_due_at` timestamp has been reached. When a scheduled round starts, the timestamp advances by whole cadence periods (default: 168 hours = weekly) until it is in the future, so a round's own duration never shifts the schedule, a failed round still consumes its slot, and after downtime at most one catch-up round runs before the schedule snaps back to its fixed phase. Dry-runs and admin override rounds never touch the schedule; manual triggers require the explicit `reanchor` flag described above. The timestamp is seeded on the first post-deploy check from the legacy last-attempt + cadence formula (a scheduling no-op) and is visible as `scheduler.next_due_at` on `/api/scoring/health`. Changing `SCORING_CADENCE_HOURS` takes effect at the next advance; trigger with `reanchor=true` to apply a new cadence immediately. The first check happens after `SCHEDULER_STARTUP_DELAY_SECONDS` plus the 5-minute check interval.
+
+**Validator manifests:** VL signing needs each selected validator's manifest. The service asks the RPC node (`RPC_URL`) first and remembers every answer in the `validator_manifests` table; when the node has no manifest for a selected validator it falls back to the stored copy and logs a warning naming the round and the keys (`signing with stored manifests for ...`). If the node is unreachable the service resolves from the store only, after a single probe, instead of timing out per key. A round fails at `VL_SIGNED` only when neither source has a manifest. Since postfiatd 1.0.6 nodes keep only a bounded set of manifests for validators outside their list and drop them on restart, so this fallback is what keeps a newly selected candidate signable; the store is refreshed with every validator seen at collection time. A dry run reports the same check as `manifest_check`.
 
 **Round numbers vs VL sequence numbers:** Public round numbers increment on every public attempt (including failures). Dry-runs use private `dry_run_id` values instead. A round's `vl_sequence` field is `null` until the `VL_SIGNED` stage completes. If a round fails before `VL_SIGNED`, the reserved sequence is released. If a round fails after `VL_SIGNED`, the sequence may already be confirmed.
 

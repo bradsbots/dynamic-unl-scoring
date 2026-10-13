@@ -21,10 +21,15 @@ from scoring_service.config import settings
 from scoring_service.database import get_db
 from scoring_service.models import ScoringSnapshot
 from scoring_service.services.collector import DataCollectorService
+from scoring_service.services.diversity_formula import apply_diversity_formula
 from scoring_service.services.dry_runs import (
     create_dry_run,
     fail_dry_run,
     update_dry_run,
+)
+from scoring_service.services.manifest_store import (
+    refresh_manifest_store,
+    resolve_manifests,
 )
 from scoring_service.services.ipfs_publisher import (
     InputPackagePublication,
@@ -33,6 +38,7 @@ from scoring_service.services.ipfs_publisher import (
 )
 from scoring_service.services.onchain_publisher import OnChainPublisherService
 from scoring_service.services.prompt_builder import PromptBuilder
+from scoring_service.services.provider_families import build_diversity_inputs
 from scoring_service.services.response_parser import ScoringResult, parse_response
 from scoring_service.services.score_formula import apply_formula
 from scoring_service.services.unl_selector import UNLSelectionResult, select_unl
@@ -357,6 +363,7 @@ def _load_pending_publication(conn, round_number: int) -> dict | None:
         previous_unl=(input_package_files.get("inputs/previous_unl.json", {}) or {}).get(
             "previous_unl", []
         ),
+        diversity_inputs=input_package_files.get("inputs/diversity_inputs.json", {}),
         files=input_package_files,
     )
     return {
@@ -650,6 +657,17 @@ class ScoringOrchestrator:
             result["status"] = RoundState.FAILED.value
             return result
 
+        # Remember the manifests of every collected validator while the RPC
+        # node still knows them, so a candidate stays signable even if the
+        # node has forgotten its manifest by the time it is selected.
+        try:
+            refresh_manifest_store(
+                conn, self._rpc, [v.master_key for v in snapshot.validators]
+            )
+        except Exception as exc:
+            conn.rollback()
+            logger.warning("Manifest store refresh skipped: %s", exc)
+
         # --- Step 2: INPUT_FROZEN ---
         try:
             messages, validator_id_map = self._prompt_builder.build(snapshot)
@@ -739,10 +757,14 @@ class ScoringOrchestrator:
         try:
             # Select from the previous UNL frozen into the input package, not
             # live DB state, so selection is reproducible from the frozen inputs.
-            # Selection consumes deterministic final scores; scoring_result
-            # keeps the model's advisory scores for the published artifacts.
+            # Selection consumes the computed diversity and deterministic final
+            # scores; scoring_result keeps the model's advisory scores for the
+            # published artifacts.
             unl_result = select_unl(
-                apply_formula(scoring_result), input_package.previous_unl
+                apply_formula(
+                    apply_diversity_formula(scoring_result, input_package.diversity_inputs)
+                ),
+                input_package.previous_unl,
             )
             _update_round(conn, round_id, status=RoundState.SELECTED.value)
             result["validator_count"] = len(unl_result.unl)
@@ -757,10 +779,22 @@ class ScoringOrchestrator:
         try:
             vl_sequence = reserve_next_sequence(conn)
             conn.commit()
-            manifests = self._rpc.fetch_manifests(unl_result.unl)
+            resolution = resolve_manifests(conn, self._rpc, unl_result.unl)
+            if resolution.missing:
+                raise ValueError(
+                    "Missing manifest for validators: "
+                    + ", ".join(resolution.missing)
+                )
+            if resolution.from_store:
+                logger.warning(
+                    "Round %d: signing with stored manifests for %s",
+                    round_number,
+                    ", ".join(resolution.from_store),
+                )
+                result["manifests_from_store"] = resolution.from_store
             signed_vl = generate_vl(
                 unl_result.unl,
-                manifests,
+                resolution.manifests,
                 vl_sequence,
                 effective_at=vl_effective_at,
             )
@@ -770,6 +804,7 @@ class ScoringOrchestrator:
             )
             result["vl_sequence"] = vl_sequence
         except Exception as exc:
+            conn.rollback()
             _release_reserved_sequence(conn, vl_sequence)
             _fail_round(conn, round_id, f"VL_SIGNED: {exc}")
             conn.close()
@@ -1087,7 +1122,14 @@ class ScoringOrchestrator:
         # --- Step 3: SELECTED ---
         try:
             previous_unl = _get_previous_unl(conn)
-            unl_result = select_unl(apply_formula(scoring_result), previous_unl)
+            unl_result = select_unl(
+                apply_formula(
+                    apply_diversity_formula(
+                        scoring_result, build_diversity_inputs(snapshot.validators)
+                    )
+                ),
+                previous_unl,
+            )
             update_dry_run(conn, dry_run_id, status=RoundState.SELECTED.value)
             result["validator_count"] = len(unl_result.unl)
         except Exception as exc:
@@ -1095,6 +1137,26 @@ class ScoringOrchestrator:
             conn.close()
             result["status"] = RoundState.FAILED.value
             return result
+
+        # --- Step 3b: Manifest availability check (report only) ---
+        # A real round fails at VL_SIGNED when a selected validator has no
+        # manifest on the RPC node or in the store; surface that here first.
+        try:
+            resolution = resolve_manifests(conn, self._rpc, unl_result.unl)
+            manifest_check = resolution.as_check()
+            update_dry_run(
+                conn, dry_run_id, manifest_check=json.dumps(manifest_check)
+            )
+            result["manifest_check"] = manifest_check
+            if resolution.missing:
+                logger.warning(
+                    "Dry run %d: no manifest for %s",
+                    dry_run_id,
+                    ", ".join(resolution.missing),
+                )
+        except Exception as exc:
+            conn.rollback()
+            logger.warning("Dry run %d: manifest check skipped: %s", dry_run_id, exc)
 
         # --- Step 4: Store private review artifacts ---
         try:
@@ -1194,10 +1256,22 @@ class ScoringOrchestrator:
         try:
             vl_sequence = reserve_next_sequence(conn)
             conn.commit()
-            manifests = self._rpc.fetch_manifests(master_keys)
+            resolution = resolve_manifests(conn, self._rpc, master_keys)
+            if resolution.missing:
+                raise ValueError(
+                    "Missing manifest for validators: "
+                    + ", ".join(resolution.missing)
+                )
+            if resolution.from_store:
+                logger.warning(
+                    "Override round %d: signing with stored manifests for %s",
+                    round_number,
+                    ", ".join(resolution.from_store),
+                )
+                result["manifests_from_store"] = resolution.from_store
             signed_vl = generate_vl(
                 master_keys,
-                manifests,
+                resolution.manifests,
                 vl_sequence,
                 effective_lookahead_hours=lookahead,
                 expiration_days=expiration_days,
@@ -1208,6 +1282,7 @@ class ScoringOrchestrator:
             )
             result["vl_sequence"] = vl_sequence
         except Exception as exc:
+            conn.rollback()
             _release_reserved_sequence(conn, vl_sequence)
             _fail_round(conn, round_id, f"VL_SIGNED: {exc}")
             conn.close()
