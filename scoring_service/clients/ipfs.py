@@ -119,7 +119,9 @@ class IPFSClient:
                     response = client.post(url, files=multipart_files)
                     response.raise_for_status()
 
-                root_cid = _parse_directory_response(response.text)
+                root_cid = _parse_directory_response(
+                    response.text, expected_paths=set(files)
+                )
                 if not root_cid:
                     logger.error("Failed to extract root CID from IPFS response")
                     return None
@@ -152,23 +154,52 @@ class IPFSClient:
         return None
 
 
-def _parse_directory_response(body: str) -> str | None:
+def _parse_directory_response(
+    body: str, expected_paths: set[str] | None = None
+) -> str | None:
     """Extract the root directory CID from a newline-delimited JSON response.
 
     The IPFS add API with wrap-with-directory returns one JSON object per
     line. Each file gets an entry with its path in the Name field. The
     final entry has an empty Name and contains the root directory CID.
+
+    Lines that do not parse, or parse to something other than a JSON
+    object, are skipped. The last empty-Name entry decides the root, and
+    its Hash must be a non-empty string, otherwise there is no root. When
+    ``expected_paths`` is given, every path must appear as a Name in the
+    response (extra entries such as intermediate directories are allowed);
+    a partial response yields None so the caller treats the add as failed.
     """
     root_cid = None
+    seen_names: set[str] = set()
     for line in body.strip().splitlines():
         line = line.strip()
         if not line:
             continue
         try:
             entry = json.loads(line)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
+            # JSONDecodeError, oversized integers and over-deep nesting.
             logger.warning("Skipping malformed IPFS response line: %s", line)
             continue
-        if entry.get("Name") == "":
-            root_cid = entry.get("Hash")
+        if not isinstance(entry, dict):
+            logger.warning("Skipping malformed IPFS response line: %s", line)
+            continue
+        name = entry.get("Name")
+        if isinstance(name, str):
+            seen_names.add(name)
+        if name == "":
+            cid = entry.get("Hash")
+            root_cid = cid if isinstance(cid, str) and cid else None
+    if root_cid is None:
+        return None
+    if expected_paths is not None:
+        missing = set(expected_paths) - seen_names
+        if missing:
+            logger.error(
+                "IPFS directory response is missing %d uploaded path(s): %s",
+                len(missing),
+                sorted(missing),
+            )
+            return None
     return root_cid
